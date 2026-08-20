@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from hs_connectors.accelerator import AcceleratorContext
 from hs_connectors.mooncake_store import (
     MooncakeHiddenStatesStore,
     MooncakeStoreConfig,
@@ -156,9 +157,10 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_cache: torch.Tensor | None = None
         self._is_tp_rank_zero: bool = True
         self._store_ready: bool = False
-        # Dedicated CUDA stream for DtoH copies so they don't block
-        # the default stream (model forward).
-        self._copy_stream: torch.cuda.Stream | None = None
+        # Dedicated accelerator stream for DtoH copies so they don't block
+        # the default stream (model forward). The module is selected from the
+        # KV cache device, so this works with both torch.cuda and torch.npu.
+        self._accelerator: AcceleratorContext | None = None
         self._num_writer_threads = mooncake_cfg.num_writer_threads
         self._executor: ThreadPoolExecutor | None = None
         self._req_futures: dict[str, Future] = {}
@@ -200,7 +202,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             f"Expected 1 CacheOnlyAttentionLayer, got {len(cache_layers)}"
         )
         self._kv_cache = kv_caches[cache_layers[0]]
-        self._copy_stream = torch.cuda.Stream()
+        self._accelerator = AcceleratorContext.for_device(self._kv_cache.device)
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -215,13 +217,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._store.setup()
             self._store_ready = True
 
-    def _write_sample(
-        self, pending: PendingSave, ready_event: torch.cuda.Event
-    ) -> None:
+    def _write_sample(self, pending: PendingSave, ready_event: Any) -> None:
         assert self._kv_cache is not None
-        assert self._copy_stream is not None
+        assert self._accelerator is not None
 
-        copy_stream = self._copy_stream
+        copy_stream = self._accelerator.copy_stream
         # Make the copy stream wait until the forward pass has finished
         # writing to the KV cache (the event was recorded on the default
         # stream in get_finished).
@@ -238,7 +238,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         num_tokens = pending.token_ids.shape[0]
 
         try:
-            with torch.cuda.stream(copy_stream):
+            with self._accelerator.use_copy_stream():
                 slot_mapping = slot_mapping.to(self._kv_cache.device, non_blocking=True)
                 hidden_states = extract_from_kv_cache(
                     self._kv_cache, slot_mapping, num_tokens
@@ -283,8 +283,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     # Record an event on the current (default) stream so
                     # the worker thread can wait for the forward pass to
                     # finish writing to the KV cache before reading it.
-                    ready_event = torch.cuda.Event()
-                    ready_event.record()
+                    assert self._accelerator is not None
+                    ready_event = self._accelerator.record_event()
                     self._req_futures[pending.req_id] = self._get_executor().submit(
                         self._write_sample, pending, ready_event
                     )
