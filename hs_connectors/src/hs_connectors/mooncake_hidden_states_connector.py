@@ -214,6 +214,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _ensure_store(self) -> None:
         if not self._store_ready:
+            assert self._accelerator is not None
+            self._accelerator.activate_device()
             self._store.setup()
             self._store_ready = True
 
@@ -221,6 +223,10 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         assert self._kv_cache is not None
         assert self._accelerator is not None
 
+        # Device state is thread-local on Ascend. The writer runs outside the
+        # vLLM worker thread, so activate the KV cache device before using its
+        # event or copy stream.
+        self._accelerator.activate_device()
         copy_stream = self._accelerator.copy_stream
         # Make the copy stream wait until the forward pass has finished
         # writing to the KV cache (the event was recorded on the default

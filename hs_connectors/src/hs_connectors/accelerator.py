@@ -37,5 +37,14 @@ class AcceleratorContext:
         event.record()
         return event
 
+    def activate_device(self) -> None:
+        """Make the copy stream's device current in the calling thread."""
+        if not hasattr(self.module, "set_device"):
+            raise RuntimeError(
+                f"Accelerator {self.copy_stream.device.type!r} cannot activate "
+                "the hidden-state copy device; missing API: set_device"
+            )
+        self.module.set_device(self.copy_stream.device)
+
     def use_copy_stream(self) -> AbstractContextManager[Any]:
         return self.module.stream(self.copy_stream)
