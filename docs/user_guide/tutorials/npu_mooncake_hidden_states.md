@@ -21,6 +21,10 @@ pinned host memory，然后通过 Mooncake 发布。远端 consumer 从 vLLM 响
 
 ## 环境准备
 
+如果 Ascend NPU wheel 即使在 `protocol=tcp` 下仍加载 Ascend Direct transport，
+请按 [Docker 内源码构建 Mooncake TCP-only 版本](mooncake_tcp_source_build.md)
+构建并安装经过验证的 TCP-only 版本。
+
 vLLM producer 和远端 consumer 都需要安装 Mooncake 和当前版本的
 `hs_connectors`。运行 `mooncake_master` 的节点也需要安装 Mooncake。
 
