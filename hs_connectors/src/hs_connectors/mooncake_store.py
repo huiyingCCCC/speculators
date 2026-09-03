@@ -162,13 +162,23 @@ class MooncakeHiddenStatesStore:
         if self._store is None:
             raise RuntimeError("call setup() first")
 
-        prepared = {name: _cpu_contiguous(tensor) for name, tensor in tensors.items()}
+        # Keep accelerator tensors resident for Ascend Direct.  Host tensors
+        # continue to use the portable put_tensor path (for example token ids).
+        prepared = {
+            name: (
+                tensor.detach().contiguous()
+                if self.config.protocol == "ascend" and tensor.device.type == "npu"
+                else _cpu_contiguous(tensor)
+            )
+            for name, tensor in tensors.items()
+        }
         manifest_tensors: dict[str, dict[str, Any]] = {}
         for name, tensor in prepared.items():
+            checksum_tensor = _cpu_contiguous(tensor)
             manifest_tensors[name] = {
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype),
-                "checksum": _tensor_checksum(tensor),
+                "checksum": _tensor_checksum(checksum_tensor),
             }
 
         written_keys: list[str] = []
@@ -176,9 +186,24 @@ class MooncakeHiddenStatesStore:
         try:
             for name, tensor in prepared.items():
                 tensor_key = f"{key}:{name}"
-                result = self._store.put_tensor(tensor_key, tensor)
+                if self.config.protocol == "ascend" and tensor.device.type == "npu":
+                    if not tensor.is_contiguous():
+                        raise ValueError(
+                            f"Ascend Direct tensor {name!r} must be contiguous"
+                        )
+                    size = tensor.numel() * tensor.element_size()
+                    ptr = tensor.data_ptr()
+                    register_result = self._store.register_buffer(ptr, size)
+                    _check_store_result("register_buffer", tensor_key, register_result)
+                    result = self._store.batch_put_from(
+                        [tensor_key], [ptr], [size]
+                    )[0]
+                    operation = "batch_put_from"
+                else:
+                    result = self._store.put_tensor(tensor_key, tensor)
+                    operation = "put_tensor"
                 written_keys.append(tensor_key)
-                _check_store_result("put_tensor", tensor_key, result)
+                _check_store_result(operation, tensor_key, result)
 
             manifest = {
                 "version": _MANIFEST_VERSION,

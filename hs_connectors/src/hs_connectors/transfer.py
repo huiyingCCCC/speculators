@@ -251,9 +251,15 @@ class MooncakeBackend(HiddenStatesBackend):
         )
         parser.add_argument(
             "--mooncake-protocol",
-            choices=["tcp", "rdma"],
+            choices=["tcp", "rdma", "ascend"],
             default="tcp",
             help="Mooncake transport protocol. Used with backend=mooncake.",
+        )
+        parser.add_argument(
+            "--mooncake-device-name",
+            type=str,
+            default="",
+            help="Ascend Direct/RDMA device name; empty enables auto-selection.",
         )
         parser.add_argument(
             "--mooncake-global-segment-gib",
@@ -302,6 +308,7 @@ class MooncakeBackend(HiddenStatesBackend):
                 global_segment_size=round(args.mooncake_global_segment_gib * 1024**3),
                 local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
                 protocol=args.mooncake_protocol,
+                device_name=args.mooncake_device_name,
             )
         )
         return MooncakeTransfer(store)
@@ -319,6 +326,7 @@ class MooncakeBackend(HiddenStatesBackend):
             global_segment_size=round(args.mooncake_global_segment_gib * 1024**3),
             local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
             protocol=args.mooncake_protocol,
+            device_name=args.mooncake_device_name,
             num_writer_threads=args.mooncake_writer_threads,
         )
 
