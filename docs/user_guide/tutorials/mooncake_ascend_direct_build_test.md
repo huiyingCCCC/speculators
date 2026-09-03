@@ -249,3 +249,164 @@ NPU buffer
 - 两台机器之间的 RoCE/RDMA 链路；
 - Speculators hidden-state connector 的 Ascend Direct 零拷贝改造；
 - vLLM-Ascend 与训练机之间的完整在线训练链路。
+
+## 双机基础测试（不依赖 PD）
+
+当 PD 分离是否可用尚未确定时，先使用 HIXL 示例独立验证两台机器之间的
+Mooncake Ascend Direct tensor 传输。该测试不启动 vLLM，也不依赖 Speculators。
+
+以下假设：
+
+```text
+机器 A：10.10.1.11，rank 0，NPU 0
+机器 B：10.10.1.12，rank 1，NPU 0
+Master：机器 A，10.10.1.11
+```
+
+将示例中的 IP 替换为实际可路由业务 IP。两台机器必须安装相同的 Mooncake
+Ascend Direct wheel，并设置相同的 CANN/Mooncake 环境：
+
+```bash
+source /usr/local/Ascend/cann-9.0.1/bin/setenv.bash
+export PYTHONPATH=/usr/local/python3.12.13/lib/python3.12/site-packages:$PYTHONPATH
+export LD_LIBRARY_PATH=/usr/local/python3.12.13/lib/python3.12/site-packages/mooncake:$LD_LIBRARY_PATH
+export HCCL_INTRA_ROCE_ENABLE=1
+export ASCEND_GLOBAL_EVENT_ENABLE=1
+export MC_LOG_LEVEL=INFO
+```
+
+检查 Mooncake 和 NPU：
+
+```bash
+python - <<'PY'
+import torch
+import mooncake
+import mooncake.engine
+import mooncake.store
+
+print("npu_count:", torch.npu.device_count())
+print("mooncake:", mooncake.__file__)
+print("engine:", mooncake.engine.__file__)
+print("store:", mooncake.store.__file__)
+PY
+
+ls -l /usr/local/python3.12.13/lib/python3.12/site-packages/mooncake/ascend_transport.so
+```
+
+### 端口检查
+
+当前容器可能没有 `nc`。可使用 Python 检查 master 的 gRPC 和 HTTP 端口：
+
+```bash
+python - 10.10.1.11 <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+for port in (50051, 8080):
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            print(f"{host}:{port} open")
+    except OSError as exc:
+        print(f"{host}:{port} closed: {exc}")
+PY
+```
+
+如果系统安装了 `nc`，等价检查为：
+
+```bash
+nc -vz 10.10.1.11 50051
+nc -vz 10.10.1.11 8080
+```
+
+### 启动 master
+
+只在机器 A 启动一个 master：
+
+```bash
+/usr/local/bin/mooncake_master \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
+```
+
+机器 B 检查：
+
+```bash
+curl http://10.10.1.11:8080/metadata
+python -c 'import socket; socket.create_connection(("10.10.1.11", 50051), 5); print("50051 open")'
+```
+
+### HIXL 双机 d2d
+
+两台机器都获取 HIXL 示例：
+
+```bash
+git clone --depth 1 https://github.com/kvcache-ai/hixl.git /tmp/hixl-ref
+cd /tmp/hixl-ref/examples/third_parties/mooncake_store/python
+```
+
+创建 `config.yaml`。机器 A 的 `store_ip` 为 `10.10.1.11`，机器 B 的
+`store_ip` 为 `10.10.1.12`，其余配置相同：
+
+```yaml
+distributed:
+  enabled: true
+  world_size: 2
+  master_addr: "10.10.1.11"
+  master_port: "29500"
+
+mooncake:
+  store_ip: "10.10.1.11"  # 机器 B 改为 10.10.1.12
+  port_start: 12345
+  metadata_url: "http://10.10.1.11:8080/metadata"
+  grpc_url: "10.10.1.11:50051"
+```
+
+机器 A：
+
+```bash
+python3 batch_put_get_sample.py \
+  --device_id=0 \
+  --schema=d2d \
+  --config=config.yaml \
+  --rank=0 \
+  --world_size=2 \
+  --distributed \
+  2>&1 | tee /tmp/hixl-rank0.log
+```
+
+机器 B：
+
+```bash
+python3 batch_put_get_sample.py \
+  --device_id=0 \
+  --schema=d2d \
+  --config=config.yaml \
+  --rank=1 \
+  --world_size=2 \
+  --distributed \
+  2>&1 | tee /tmp/hixl-rank1.log
+```
+
+成功标准：
+
+```text
+两端均完成 Mooncake store 初始化；
+两端均出现 Retrieved ... : 147456 bytes；
+无 Unsupported transport ascend；
+无 Client is not initialized；
+无负数错误码或 segmentation fault。
+```
+
+检查是否加载 Ascend Direct：
+
+```bash
+rg -i "ascend|roce|hccs|transport|register_buffer|batch_put|batch_get" \
+  /tmp/hixl-rank0.log /tmp/hixl-rank1.log
+```
+
+如果出现 `No RDMA devices found`，不能仅凭程序成功判断双机 RoCE 已验证；
+需要结合日志和设备可见性确认实际走的是 Ascend Direct/RoCE，而不是 TCP 或
+其他本机回退路径。只有双机测试成功且日志确认使用 Ascend Direct，才能得出
+“两机 Mooncake ADXL tensor 传输可用”的结论。
