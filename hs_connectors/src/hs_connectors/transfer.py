@@ -216,6 +216,17 @@ class MooncakeTransfer(HiddenStatesTransfer):
 
     def setup(self) -> None:
         if not self.store.is_setup:
+            # Ascend Direct transport needs an active NPU context
+            # (aclrtSetDevice) in the calling process. DataLoader workers
+            # inherit the parent rank's device but do not activate it, so
+            # engine.initialize can fail with a null runtime context.
+            if self.store.config.protocol == "ascend":
+                try:
+                    import torch_npu  # noqa: PLC0415
+
+                    torch_npu.npu.set_device(torch_npu.npu.current_device())
+                except Exception:  # noqa: BLE001
+                    pass
             self.store.setup()
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002
