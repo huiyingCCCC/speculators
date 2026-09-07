@@ -213,6 +213,10 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         return self._executor
 
     def _ensure_store(self) -> None:
+        # Only TP0 publishes the complete extracted hidden state. Other TP
+        # workers must not create competing Ascend Direct engines.
+        if not self._is_tp_rank_zero:
+            return
         if not self._store_ready:
             assert self._accelerator is not None
             self._accelerator.activate_device()

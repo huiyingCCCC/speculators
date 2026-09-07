@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 import time
 import zlib
 from dataclasses import dataclass
@@ -109,14 +111,21 @@ class MooncakeHiddenStatesStore:
         self.config = config
         self._store = None
         self._engine = None
+        self._owner_pid: int | None = None
+        self._register_lock = threading.Lock()
 
     @property
     def is_setup(self):
-        return self._store is not None
+        return self._store is not None and self._owner_pid == os.getpid()
 
     def setup(self) -> MooncakeHiddenStatesStore:
-        if self._store is not None:
+        pid = os.getpid()
+        if self._store is not None and self._owner_pid == pid:
             return self
+        if self._store is not None and self._owner_pid != pid:
+            # Native Mooncake handles must never be reused after fork.
+            self._store = None
+            self._engine = None
         try:
             from mooncake.engine import (  # type: ignore[import-not-found] # noqa: PLC0415
                 TransferEngine,
@@ -156,6 +165,7 @@ class MooncakeHiddenStatesStore:
         # MooncakeDistributedStore retains only the native engine handle.
         self._engine = engine
         self._store = store
+        self._owner_pid = pid
         return self
 
     def put_sample(self, key: str, tensors: dict[str, torch.Tensor]) -> None:
@@ -193,11 +203,20 @@ class MooncakeHiddenStatesStore:
                         )
                     size = tensor.numel() * tensor.element_size()
                     ptr = tensor.data_ptr()
-                    register_result = self._store.register_buffer(ptr, size)
-                    _check_store_result("register_buffer", tensor_key, register_result)
-                    result = self._store.batch_put_from(
-                        [tensor_key], [ptr], [size]
-                    )[0]
+                    with self._register_lock:
+                        register_result = self._store.register_buffer(ptr, size)
+                        _check_store_result(
+                            "register_buffer", tensor_key, register_result
+                        )
+                        try:
+                            result = self._store.batch_put_from(
+                                [tensor_key], [ptr], [size]
+                            )[0]
+                        finally:
+                            unregister_result = self._store.unregister_buffer(ptr)
+                            _check_store_result(
+                                "unregister_buffer", tensor_key, unregister_result
+                            )
                     operation = "batch_put_from"
                 else:
                     result = self._store.put_tensor(tensor_key, tensor)
