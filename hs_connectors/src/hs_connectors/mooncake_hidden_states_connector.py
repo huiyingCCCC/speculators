@@ -190,6 +190,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._is_tp_rank_zero = get_tensor_model_parallel_rank() == 0
 
+        if not self._is_tp_rank_zero:
+            # Non-zero TP workers do not publish hidden states and must not
+            # retain an accelerator/store handle for the producer path.
+            return
+
         from vllm.model_executor.models.extract_hidden_states import (  # noqa: PLC0415
             CacheOnlyAttentionLayer,
         )
@@ -202,7 +207,14 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             f"Expected 1 CacheOnlyAttentionLayer, got {len(cache_layers)}"
         )
         self._kv_cache = kv_caches[cache_layers[0]]
-        self._accelerator = AcceleratorContext.for_device(self._kv_cache.device)
+        if self._is_tp_rank_zero:
+            self._accelerator = AcceleratorContext.for_device(self._kv_cache.device)
+            if self._num_writer_threads > 1:
+                logger.warning(
+                    "Ascend Direct producer uses one writer thread to serialize "
+                    "buffer registration and transfer"
+                )
+                self._num_writer_threads = 1
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
