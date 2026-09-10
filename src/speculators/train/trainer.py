@@ -3,7 +3,7 @@ import logging
 import time
 import warnings
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -20,6 +20,7 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+from hs_connectors.transfer import adxl_proxy_requested
 from speculators.model import SpeculatorModel
 from speculators.train.checkpointer import (
     BaseCheckpointer,
@@ -191,6 +192,86 @@ class Trainer:
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
+        self._broadcast_batches = self._detect_proxy_batch_broadcast()
+
+    def _detect_proxy_batch_broadcast(self) -> bool:
+        """Enable rank-zero batch fan-out when any rank requests ADXL proxying."""
+        if not self.is_distributed:
+            return False
+
+        # The proxy environment may be set only on non-zero nodes. Reduce the
+        # request so rank zero also knows to send its locally generated batch.
+        device = torch.device(self.device_type, self.local_rank)
+        requested = torch.tensor(
+            [int(adxl_proxy_requested())],
+            dtype=torch.int64,
+            device=device,
+        )
+        dist.all_reduce(requested, op=dist.ReduceOp.MAX)
+        return bool(requested.item())
+
+    @staticmethod
+    def _batch_to_device(
+        batch: dict[str, Any], device: torch.device
+    ) -> dict[str, Any]:
+        return {
+            key: value.to(device, non_blocking=True)
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in batch.items()
+        }
+
+    def _sync_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Move a batch to device and fan rank zero's tensors out to proxy ranks."""
+        device = torch.device(self.device_type, self.local_rank)
+        local_batch = self._batch_to_device(batch, device)
+        if not getattr(self, "_broadcast_batches", False):
+            return local_batch
+
+        keys = sorted(local_batch)
+        rank = dist.get_rank()
+        key_count = (
+            torch.tensor([len(keys)], dtype=torch.int64, device=device)
+            if rank == 0
+            else torch.empty(1, dtype=torch.int64, device=device)
+        )
+        dist.broadcast(key_count, src=0)
+        received_key_count = int(key_count.item())
+        if received_key_count != len(keys):
+            raise RuntimeError(
+                "ADXL proxy batch schema differs from rank 0: "
+                f"received {received_key_count} tensors, local schema has {len(keys)}"
+            )
+
+        received: dict[str, Any] = dict(local_batch) if rank == 0 else {}
+        for key in keys:
+            template = local_batch[key]
+            if not isinstance(template, torch.Tensor):
+                raise TypeError(f"Distributed batches only support tensors, got {key}")
+            ndim = (
+                torch.tensor([template.ndim], dtype=torch.int64, device=device)
+                if rank == 0
+                else torch.empty(1, dtype=torch.int64, device=device)
+            )
+            dist.broadcast(ndim, src=0)
+            shape = (
+                torch.tensor(template.shape, dtype=torch.int64, device=device)
+                if rank == 0
+                else torch.empty(int(ndim.item()), dtype=torch.int64, device=device)
+            )
+            dist.broadcast(shape, src=0)
+            target = (
+                template.contiguous()
+                if rank == 0
+                else torch.empty(
+                    tuple(int(dim) for dim in shape.tolist()),
+                    dtype=template.dtype,
+                    device=device,
+                )
+            )
+            dist.broadcast(target, src=0)
+            received[key] = target
+        return received
 
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
@@ -449,12 +530,7 @@ class Trainer:
             timer.reset(self.global_step % self.config.log_freq == 0)
 
             timer.mark_value("start", t_before_fetch)
-            gpu_batch = {
-                k: v.to(self.local_rank, non_blocking=True)
-                if isinstance(v, torch.Tensor)
-                else v
-                for k, v in batch.items()
-            }
+            gpu_batch = self._sync_batch(batch)
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
@@ -543,12 +619,7 @@ class Trainer:
         num_batches = len(val_loader)
         for i, batch in enumerate(val_loader):
             self._maybe_val_sync(i)
-            gpu_batch = {
-                k: v.to(self.local_rank, non_blocking=True)
-                if isinstance(v, torch.Tensor)
-                else v
-                for k, v in batch.items()
-            }
+            gpu_batch = self._sync_batch(batch)
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype

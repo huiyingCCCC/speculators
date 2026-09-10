@@ -17,6 +17,36 @@ from safetensors.torch import load_file
 
 from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
 
+ADXL_PROXY_ENV = "MOONCAKE_ADXL_PROXY"
+
+
+def adxl_proxy_requested() -> bool:
+    """Return whether the launch requested ADXL proxy coordination."""
+    return os.environ.get(ADXL_PROXY_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def adxl_proxy_enabled() -> bool:
+    """Return whether this process is a non-producing ADXL proxy.
+
+    The environment variable may be exported for the whole torchrun launch.
+    Rank zero remains the producer in that case; only non-zero ranks disable
+    vLLM and Mooncake setup.
+    """
+    if not adxl_proxy_requested():
+        return False
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() != 0
+    try:
+        return int(os.environ.get("RANK", "0")) != 0
+    except ValueError:
+        return False
+
+
 if TYPE_CHECKING:
     import argparse
     from collections.abc import Callable
@@ -211,10 +241,13 @@ class FileBackend(HiddenStatesBackend):
 class MooncakeTransfer(HiddenStatesTransfer):
     """Mooncake distributed store based hidden-states transfer."""
 
-    def __init__(self, store: MooncakeHiddenStatesStore):
+    def __init__(self, store: MooncakeHiddenStatesStore, proxy: bool = False):
         self.store = store
+        self.proxy = proxy
 
     def setup(self) -> None:
+        if self.proxy:
+            return
         if not self.store.is_setup:
             # Ascend Direct transport needs an active NPU context
             # (aclrtSetDevice) in the calling process. DataLoader workers
@@ -233,9 +266,13 @@ class MooncakeTransfer(HiddenStatesTransfer):
         return None
 
     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+        if self.proxy:
+            return None
         return self.store.get_sample(handle)
 
     def delete(self, handle: str) -> None:
+        if self.proxy:
+            return
         self.store.delete_sample(handle)
 
 
@@ -287,6 +324,18 @@ class MooncakeBackend(HiddenStatesBackend):
             default=2.0,
             help="Mooncake client's local staging buffer, in GiB.",
         )
+        parser.add_argument(
+            "--mooncake-adxl-pool-slots",
+            type=int,
+            default=2,
+            help="Number of pre-registered NPU buffers used by Ascend Direct.",
+        )
+        parser.add_argument(
+            "--mooncake-adxl-slot-mib",
+            type=int,
+            default=512,
+            help="Size of each pre-registered Ascend Direct buffer in MiB.",
+        )
 
     @staticmethod
     def add_train_args(parser: argparse.ArgumentParser) -> None:
@@ -320,9 +369,11 @@ class MooncakeBackend(HiddenStatesBackend):
                 local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
                 protocol=args.mooncake_protocol,
                 device_name=args.mooncake_device_name,
+                adxl_pool_slots=getattr(args, "mooncake_adxl_pool_slots", 2),
+                adxl_slot_bytes=getattr(args, "mooncake_adxl_slot_mib", 512) * 1024**2,
             )
         )
-        return MooncakeTransfer(store)
+        return MooncakeTransfer(store, proxy=adxl_proxy_enabled())
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -339,6 +390,8 @@ class MooncakeBackend(HiddenStatesBackend):
             protocol=args.mooncake_protocol,
             device_name=args.mooncake_device_name,
             num_writer_threads=args.mooncake_writer_threads,
+            adxl_pool_slots=getattr(args, "mooncake_adxl_pool_slots", 2),
+            adxl_slot_bytes=getattr(args, "mooncake_adxl_slot_mib", 512) * 1024**2,
         )
 
         return {

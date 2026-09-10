@@ -9,15 +9,22 @@ if TYPE_CHECKING:
 import os
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 from hs_connectors import HiddenStatesTransfer
+from hs_connectors.transfer import adxl_proxy_requested
 from speculators.train.data import (
     ArrowDataset,
     BaseDataset,
     CollateFn,
 )
-from speculators.train.distributed import get_dp_rank, get_dp_size
+from speculators.train.distributed import (
+    get_dp_rank,
+    get_dp_size,
+    get_local_rank,
+    get_rank,
+)
 from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
 )
@@ -49,6 +56,25 @@ def _worker_init_fn(worker_id: int) -> None:  # noqa: ARG001
     torch.set_num_threads(1)
 
 
+def _adxl_proxy_mode_enabled() -> bool:
+    """Return a process-group-wide proxy mode flag."""
+    requested = adxl_proxy_requested()
+    if not dist.is_available() or not dist.is_initialized():
+        return requested
+
+    accelerator = torch.accelerator.current_accelerator()
+    device = (
+        torch.device(accelerator.type, get_local_rank())
+        if accelerator is not None
+        else torch.device("cpu")
+    )
+    requested_tensor = torch.tensor(
+        [int(requested)], dtype=torch.int64, device=device
+    )
+    dist.all_reduce(requested_tensor, op=dist.ReduceOp.MAX)
+    return bool(requested_tensor.item())
+
+
 def _setup_dataloader(
     dataset: BaseDataset,
     total_seq_len: int,
@@ -57,12 +83,14 @@ def _setup_dataloader(
     num_target_layers: int = 3,
     prefetch_factor: int | None = 4,
     preprocess: Callable[[BatchType], BatchType] | None = None,
+    pin_memory: bool = True,
+    single_data_source: bool = False,
 ) -> DataLoader:
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=total_seq_len,
         lengths=dataset.approx_lengths,
-        num_replicas=get_dp_size(),
-        rank=get_dp_rank(),
+        num_replicas=1 if single_data_source else get_dp_size(),
+        rank=0 if single_data_source else get_dp_rank(),
     )
     use_workers = num_workers > 0
     return DataLoader(
@@ -70,7 +98,7 @@ def _setup_dataloader(
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if use_workers else None,
-        pin_memory=True,
+        pin_memory=pin_memory,
         collate_fn=CollateFn(
             total_seq_len,
             hidden_size,
@@ -112,6 +140,14 @@ def create_train_val_loaders(
     """
     _limit_worker_threads()
     noise_transform = AddUniformNoise(std=noise_std)
+    proxy_mode = _adxl_proxy_mode_enabled()
+    proxy = proxy_mode and get_rank() != 0
+    loader_workers = 0 if proxy_mode else num_workers
+    if proxy_mode and num_workers > 0 and get_rank() == 0:
+        logger.info(
+            "ADXL proxy mode uses the training process as the single Mooncake "
+            "consumer; disabling DataLoader workers"
+        )
 
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
@@ -130,6 +166,7 @@ def create_train_val_loaders(
         hidden_states_dtype=hidden_states_dtype,
         request_timeout=request_timeout,
         max_retries=max_retries,
+        should_generate=not proxy,
     )
     val_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
@@ -144,6 +181,7 @@ def create_train_val_loaders(
         hidden_states_dtype=hidden_states_dtype,
         request_timeout=request_timeout,
         max_retries=max_retries,
+        should_generate=not proxy,
     )
 
     train_loader = _setup_dataloader(
@@ -151,18 +189,22 @@ def create_train_val_loaders(
         total_seq_len,
         hidden_size,
         num_target_layers=num_target_layers,
-        num_workers=num_workers,
+        num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        pin_memory=not proxy,
+        single_data_source=proxy_mode,
     )
     val_loader = _setup_dataloader(
         val_dataset,
         total_seq_len,
         hidden_size,
         num_target_layers=num_target_layers,
-        num_workers=num_workers,
+        num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        pin_memory=not proxy,
+        single_data_source=proxy_mode,
     )
 
     return train_loader, val_loader

@@ -159,6 +159,7 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        should_generate: bool = True,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -188,6 +189,7 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.should_generate = should_generate
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -218,6 +220,8 @@ class ArrowDataset(BaseDataset):
         return list(self.data.with_format(None)["seq_len"])
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
+        if not self.should_generate:
+            return None
         if not self.client:
             self._setup_client()
 
@@ -259,6 +263,10 @@ class ArrowDataset(BaseDataset):
         loaded_hs = self.transfer.get_cached(file_idx)
 
         if loaded_hs is None:
+            if not self.should_generate:
+                # Proxy ranks receive rank 0's collated batch over the process
+                # group and must never initialize vLLM/Mooncake themselves.
+                return None
             match self.on_missing:
                 case "generate":
                     loaded_hs = self._maybe_generate_hs(index)
