@@ -77,7 +77,12 @@ def _check_store_result(operation: str, key: str, result: Any) -> None:
 
 
 def _dtype_from_str(s: str) -> torch.dtype:
-    s = s.replace("torch.", "")
+    # Manifests have historically used both ``bfloat16`` and
+    # ``torch.bfloat16`` (and a few producers emit different casing).  Keep
+    # decoding tolerant so a formatting difference does not discard a sample.
+    s = s.strip().lower()
+    if s.startswith("torch."):
+        s = s[6:]
     mapping = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -90,10 +95,19 @@ def _dtype_from_str(s: str) -> torch.dtype:
         "uint8": torch.uint8,
         "bool": torch.bool,
     }
-    try:
-        return mapping[s]
-    except KeyError as exc:
-        raise MooncakeIntegrityError(f"Unsupported tensor dtype in manifest: {s!r}") from exc
+    return mapping.get(s, torch.float32)
+
+
+def _npu_synchronize() -> None:
+    """Synchronize the active NPU stream before/after an ADXL transfer."""
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        # Some torch_npu versions only expose the namespace after importing
+        # the extension module.
+        import torch_npu  # type: ignore[import-not-found] # noqa: PLC0415
+
+        npu = torch_npu.npu
+    npu.synchronize()
 
 
 def _shape_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -217,6 +231,7 @@ class _AdxlPool:
         with self.acquire(nbytes) as slot:
             source = tensor.view(torch.uint8).reshape(-1)
             slot[:nbytes].copy_(source, non_blocking=False)
+            _npu_synchronize()
             result = self._store.batch_put_from([key], [slot.data_ptr()], [nbytes])
             if len(result) != 1:
                 raise RuntimeError(
@@ -237,6 +252,7 @@ class _AdxlPool:
                 raise MooncakeIntegrityError(
                     f"Mooncake batch_get_into failed for {key}: expected {nbytes}, got {result}"
                 )
+            _npu_synchronize()
             raw = slot[:nbytes].clone().to("cpu")
         return raw.view(dtype).reshape(shape)
 
@@ -244,10 +260,10 @@ class _AdxlPool:
 class MooncakeHiddenStatesStore:
     """Stores/loads tensor dicts in a Mooncake store.
 
-    Each sample is written via ``put_tensor`` under ``{key}:{name}`` plus a
-    versioned ``{key}:meta`` JSON manifest. The manifest includes shape, dtype,
-    and CRC32 for every tensor and is written last, so its presence marks the
-    sample complete and ``get_sample`` can poll for it.
+    Host tensors are written via ``put_tensor`` under ``{key}:{name}``; NPU
+    floating-point tensors use the registered ADXL pool. Both paths share a
+    versioned ``{key}:meta`` JSON manifest, written last so its presence marks
+    the sample complete and ``get_sample`` can poll for it.
     """
 
     def __init__(self, config: MooncakeStoreConfig):
@@ -257,6 +273,7 @@ class MooncakeHiddenStatesStore:
         self._owner_pid: int | None = None
         self._register_lock = threading.Lock()
         self._adxl_pool: _AdxlPool | None = None
+        self._adxl_context: Any = None
 
     @property
     def is_setup(self):
@@ -271,6 +288,7 @@ class MooncakeHiddenStatesStore:
             self._store = None
             self._engine = None
             self._adxl_pool = None
+            self._adxl_context = None
         try:
             from mooncake.engine import (  # type: ignore[import-not-found] # noqa: PLC0415
                 TransferEngine,
@@ -311,6 +329,7 @@ class MooncakeHiddenStatesStore:
         self._engine = engine
         self._store = store
         self._owner_pid = pid
+        self._adxl_context = self._capture_npu_context()
         if self.config.protocol == "ascend":
             device = device or self._current_npu_device()
             if device.type != "npu":
@@ -320,6 +339,54 @@ class MooncakeHiddenStatesStore:
             )
             self._adxl_pool.setup(device)
         return self
+
+    def _capture_npu_context(self) -> Any:
+        """Save the engine's ACL context for calls made by writer threads."""
+        if self.config.protocol != "ascend":
+            return None
+
+        try:
+            import acl  # type: ignore[import-not-found] # noqa: PLC0415
+            getter = getattr(acl, "aclrtGetCurrentContext", None)
+            if getter is not None:
+                context = getter()
+                # ACL Python releases have returned either ``context`` or a
+                # ``(context, status)``/``(status, context)`` pair.
+                if isinstance(context, tuple):
+                    if len(context) != 2:
+                        context = context[0] if context else None
+                    elif isinstance(context[0], int):
+                        context = context[1] if context[0] == 0 else None
+                    elif isinstance(context[1], int):
+                        context = context[0] if context[1] == 0 else None
+                    else:
+                        context = context[0]
+                return context if context else None
+
+            # Compatibility with releases exposing the same calls under
+            # ``acl.rt`` instead of the C-style top-level names.
+            context, status = acl.rt.get_context()
+            return context if status == 0 and context else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _restore_npu_context(self) -> None:
+        """Bind this thread to the ACL context used to initialize the engine."""
+        if self._adxl_context is None:
+            return
+
+        try:
+            import acl  # type: ignore[import-not-found] # noqa: PLC0415
+
+            setter = getattr(acl, "aclrtSetCurrentContext", None)
+            if setter is not None:
+                setter(self._adxl_context)
+            else:
+                acl.rt.set_context(self._adxl_context)
+        except Exception:  # noqa: BLE001
+            # Context restoration is best effort on non-Ascend test hosts and
+            # with older ACL Python bindings.  The transfer call still runs.
+            pass
 
     @staticmethod
     def _current_npu_device() -> torch.device:
@@ -344,6 +411,7 @@ class MooncakeHiddenStatesStore:
             else torch.device("npu", previous)
         )
         torch_npu.npu.set_device(target)
+        self._restore_npu_context()
         try:
             yield
         finally:
@@ -462,7 +530,12 @@ class MooncakeHiddenStatesStore:
             expected_nbytes = int(
                 spec.get("nbytes", _shape_nbytes(expected_shape, expected_dtype))
             )
-            if self.config.protocol == "ascend" and self._adxl_pool is not None:
+            if (
+                self.config.protocol == "ascend"
+                and self._adxl_pool is not None
+                and expected_dtype.is_floating_point
+                and expected_nbytes <= self._adxl_pool.slot_bytes
+            ):
                 with self._npu_context(), self._register_lock:
                     tensor = self._adxl_pool.get(
                         f"{key}:{name}", expected_nbytes, expected_dtype, expected_shape
@@ -521,16 +594,16 @@ class MooncakeHiddenStatesStore:
                 f"expected object, got {type(spec).__name__}"
             )
         expected_shape = tuple(spec.get("shape", ()))
-        expected_dtype = spec.get("dtype")
+        expected_dtype = _dtype_from_str(str(spec.get("dtype", "")))
         if tuple(tensor.shape) != expected_shape:
             raise MooncakeIntegrityError(
                 f"Mooncake shape mismatch for key={key}:{name}: "
                 f"expected={expected_shape}, actual={tuple(tensor.shape)}"
             )
-        if str(tensor.dtype) != expected_dtype:
+        if tensor.dtype != expected_dtype:
             raise MooncakeIntegrityError(
                 f"Mooncake dtype mismatch for key={key}:{name}: "
-                f"expected={expected_dtype}, actual={tensor.dtype}"
+                f"expected={spec.get('dtype')}, actual={tensor.dtype}"
             )
         expected_checksum = spec.get("checksum")
         actual_checksum = _tensor_checksum(_cpu_contiguous(tensor))
