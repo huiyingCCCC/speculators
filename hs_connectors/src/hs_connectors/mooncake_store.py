@@ -158,6 +158,7 @@ class _AdxlPool:
         self._store = store
         self._num_slots = num_slots
         self._slot_bytes = slot_bytes
+        self._pool: torch.Tensor | None = None
         self._slots: list[torch.Tensor] = []
         self._free: list[int] = []
         self._condition = threading.Condition()
@@ -174,37 +175,39 @@ class _AdxlPool:
     def setup(self, device: torch.device) -> None:
         if self.is_setup:
             return
-        slots: list[torch.Tensor] = []
-        registered: list[int] = []
+        total = self._slot_bytes * self._num_slots
         try:
-            for _ in range(self._num_slots):
-                slot = torch.empty(self._slot_bytes, dtype=torch.uint8, device=device)
-                result = self._store.register_buffer(slot.data_ptr(), self._slot_bytes)
-                _check_store_result("register_buffer", "<adxl-pool>", result)
-                slots.append(slot)
-                registered.append(slot.data_ptr())
+            with torch.inference_mode(False):
+                pool = torch.empty(total, dtype=torch.uint8, device=device)
+            base_ptr = pool.data_ptr()
+            result = self._store.register_buffer(base_ptr, total)
+            _check_store_result("register_buffer", "<adxl-pool>", result)
         except Exception:
-            for ptr in registered:
-                try:
-                    self._store.unregister_buffer(ptr)
-                except Exception:
-                    logger.exception("Failed to unregister ADXL pool buffer")
+            try:
+                self._store.unregister_buffer(pool.data_ptr())
+            except Exception:
+                logger.exception("Failed to unregister ADXL pool buffer")
             raise
-        self._slots = slots
-        self._free = list(range(len(slots)))
+        self._pool = pool
+        self._slots = [
+            pool[i * self._slot_bytes: (i + 1) * self._slot_bytes]
+            for i in range(self._num_slots)
+        ]
+        self._free = list(range(len(self._slots)))
         self._device = device
 
     def close(self) -> None:
-        """Unregister pool buffers. Best effort; native handles may be process-owned."""
-        for slot in self._slots:
+        """Unregister pool buffer. Best effort; native handles may be process-owned."""
+        if self._pool is not None:
             try:
                 _check_store_result(
                     "unregister_buffer",
                     "<adxl-pool>",
-                    self._store.unregister_buffer(slot.data_ptr()),
+                    self._store.unregister_buffer(self._pool.data_ptr()),
                 )
             except Exception:
                 logger.exception("Failed to unregister ADXL pool buffer")
+        self._pool = None
         self._slots.clear()
         self._free.clear()
         self._device = None
