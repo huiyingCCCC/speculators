@@ -143,6 +143,14 @@ def create_train_val_loaders(
     proxy_mode = _adxl_proxy_mode_enabled()
     proxy = proxy_mode and get_rank() != 0
     loader_workers = 0 if proxy_mode else num_workers
+    device_read = proxy_mode and get_rank() == 0 and transfer is not None
+    device_read = device_read and transfer.supports_device_read
+    hidden_states_device = None
+    if device_read:
+        accelerator = torch.accelerator.current_accelerator()
+        if accelerator is None:
+            raise RuntimeError("Ascend device-side reads require an active accelerator")
+        hidden_states_device = torch.device(accelerator.type, get_local_rank())
     if proxy_mode and num_workers > 0 and get_rank() == 0:
         logger.info(
             "ADXL proxy mode uses the training process as the single Mooncake "
@@ -167,6 +175,7 @@ def create_train_val_loaders(
         request_timeout=request_timeout,
         max_retries=max_retries,
         should_generate=not proxy,
+        hidden_states_device=hidden_states_device,
     )
     val_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
@@ -182,6 +191,7 @@ def create_train_val_loaders(
         request_timeout=request_timeout,
         max_retries=max_retries,
         should_generate=not proxy,
+        hidden_states_device=hidden_states_device,
     )
 
     train_loader = _setup_dataloader(
@@ -192,7 +202,7 @@ def create_train_val_loaders(
         num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
-        pin_memory=not proxy,
+        pin_memory=not proxy_mode,
         single_data_source=proxy_mode,
     )
     val_loader = _setup_dataloader(
@@ -203,7 +213,7 @@ def create_train_val_loaders(
         num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
-        pin_memory=not proxy,
+        pin_memory=not proxy_mode,
         single_data_source=proxy_mode,
     )
 

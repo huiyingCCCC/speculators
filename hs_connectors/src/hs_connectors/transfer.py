@@ -76,6 +76,11 @@ def wait_for_lock(lock_path: str, timeout: float = 10.0, poll_interval: float = 
 class HiddenStatesTransfer(ABC):
     """Interface for reading hidden states produced by vLLM."""
 
+    @property
+    def supports_device_read(self) -> bool:
+        """Whether generated hidden states can be read into a device tensor."""
+        return False
+
     def setup(self) -> None:  # noqa: B027
         """Lazy initialization (safe to call from dataloader worker)."""
 
@@ -84,7 +89,13 @@ class HiddenStatesTransfer(ABC):
         """Return a previously cached sample, or ``None``."""
 
     @abstractmethod
-    def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+    def get_generated(
+        self,
+        handle: str,
+        *,
+        hidden_states_out: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor] | None:
         """Retrieve a freshly generated sample by its vLLM-returned handle."""
 
     def cache(self, handle: str, file_idx: int) -> None:  # noqa: B027
@@ -173,7 +184,13 @@ class FileTransfer(HiddenStatesTransfer):
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
         return _load_hs_file(path)
 
-    def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+    def get_generated(
+        self,
+        handle: str,
+        *,
+        hidden_states_out: torch.Tensor | None = None,  # noqa: ARG002
+        device: torch.device | None = None,  # noqa: ARG002
+    ) -> dict[str, torch.Tensor] | None:
         return _load_hs_file(Path(handle))
 
     def cache(self, handle: str, file_idx: int) -> None:
@@ -245,6 +262,10 @@ class MooncakeTransfer(HiddenStatesTransfer):
         self.store = store
         self.proxy = proxy
 
+    @property
+    def supports_device_read(self) -> bool:
+        return not self.proxy and self.store.config.protocol == "ascend"
+
     def setup(self) -> None:
         if self.proxy:
             return
@@ -265,9 +286,19 @@ class MooncakeTransfer(HiddenStatesTransfer):
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002
         return None
 
-    def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+    def get_generated(
+        self,
+        handle: str,
+        *,
+        hidden_states_out: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor] | None:
         if self.proxy:
             return None
+        if hidden_states_out is not None or device is not None:
+            return self.store.get_sample_into(
+                handle, hidden_states_out, device=device
+            )
         return self.store.get_sample(handle)
 
     def delete(self, handle: str) -> None:
