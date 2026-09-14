@@ -142,9 +142,11 @@ def create_train_val_loaders(
     noise_transform = AddUniformNoise(std=noise_std)
     proxy_mode = _adxl_proxy_mode_enabled()
     proxy = proxy_mode and get_rank() != 0
-    loader_workers = 0 if proxy_mode else num_workers
-    device_read = proxy_mode and get_rank() == 0 and transfer is not None
-    device_read = device_read and transfer.supports_device_read
+    device_read = transfer is not None and transfer.supports_device_read
+    # Device-side reads perform NPU/ACL operations in Dataset.__getitem__;
+    # DataLoader subprocesses must not own those runtime contexts.  This only
+    # affects backends advertising device reads (currently Ascend Mooncake).
+    loader_workers = 0 if proxy_mode or device_read else num_workers
     hidden_states_device = None
     if device_read:
         accelerator = torch.accelerator.current_accelerator()
@@ -155,6 +157,11 @@ def create_train_val_loaders(
         logger.info(
             "ADXL proxy mode uses the training process as the single Mooncake "
             "consumer; disabling DataLoader workers"
+        )
+    elif device_read and num_workers > 0:
+        logger.info(
+            "Device-side hidden-state reads use the training process; "
+            "disabling DataLoader workers"
         )
 
     if not (0.0 < train_data_ratio < 1.0):

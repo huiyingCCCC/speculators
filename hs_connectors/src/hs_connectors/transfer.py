@@ -18,10 +18,21 @@ from safetensors.torch import load_file
 from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
 
 ADXL_PROXY_ENV = "MOONCAKE_ADXL_PROXY"
+_direct_read_enabled = False
+
+
+def _set_direct_read_enabled(enabled: bool) -> None:
+    """Set direct-read state for this training process."""
+    global _direct_read_enabled  # noqa: PLW0603
+    _direct_read_enabled = enabled
 
 
 def adxl_proxy_requested() -> bool:
     """Return whether the launch requested ADXL proxy coordination."""
+    # Direct-read mode supersedes proxy broadcast.  This is process-local state
+    # set by the selected Mooncake backend, not a global environment override.
+    if _direct_read_enabled:
+        return False
     return os.environ.get(ADXL_PROXY_ENV, "").strip().lower() in {
         "1",
         "true",
@@ -404,7 +415,16 @@ class MooncakeBackend(HiddenStatesBackend):
                 adxl_slot_bytes=getattr(args, "mooncake_adxl_slot_mib", 512) * 1024**2,
             )
         )
-        return MooncakeTransfer(store, proxy=adxl_proxy_enabled())
+        if args.mooncake_protocol == "ascend":
+            # Every training rank owns a Mooncake consumer and reads its own
+            # samples.  This disables the legacy rank-0 proxy broadcast while
+            # leaving TCP/RDMA/File backends untouched.
+            _set_direct_read_enabled(True)
+            proxy = False
+        else:
+            _set_direct_read_enabled(False)
+            proxy = adxl_proxy_enabled()
+        return MooncakeTransfer(store, proxy=proxy)
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
