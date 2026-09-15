@@ -477,12 +477,21 @@ class MooncakeHiddenStatesStore:
         }
         manifest_tensors: dict[str, dict[str, Any]] = {}
         for name, tensor in prepared.items():
-            checksum_tensor = _cpu_contiguous(tensor)
+            is_adxl_tensor = (
+                self.config.protocol == "ascend" and tensor.device.type == "npu"
+            )
+            # Computing a CRC for an NPU tensor would force a full device-to-host
+            # copy and erase the benefit of the direct-read path.
+            checksum = (
+                None
+                if is_adxl_tensor
+                else _tensor_checksum(tensor)
+            )
             manifest_tensors[name] = {
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype),
                 "nbytes": _shape_nbytes(tuple(tensor.shape), tensor.dtype),
-                "checksum": _tensor_checksum(checksum_tensor),
+                "checksum": checksum,
             }
 
         written_keys: list[str] = []
@@ -725,7 +734,22 @@ class MooncakeHiddenStatesStore:
                 f"Mooncake dtype mismatch for key={key}:{name}: "
                 f"expected={spec.get('dtype')}, actual={tensor.dtype}"
             )
-        expected_checksum = spec.get("checksum")
+        expected_nbytes = int(
+            spec.get("nbytes", _shape_nbytes(expected_shape, expected_dtype))
+        )
+        actual_nbytes = tensor.numel() * tensor.element_size()
+        if actual_nbytes != expected_nbytes:
+            raise MooncakeIntegrityError(
+                f"Mooncake size mismatch for key={key}:{name}: "
+                f"expected={expected_nbytes}, actual={actual_nbytes}"
+            )
+        if "checksum" not in spec:
+            raise MooncakeIntegrityError(
+                f"Mooncake checksum missing for key={key}:{name}"
+            )
+        expected_checksum = spec["checksum"]
+        if expected_checksum is None:
+            return
         actual_checksum = _tensor_checksum(_cpu_contiguous(tensor))
         if actual_checksum != expected_checksum:
             raise MooncakeIntegrityError(
