@@ -209,7 +209,7 @@ def create_train_val_loaders(
         num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
-        pin_memory=not proxy_mode,
+        pin_memory=not proxy_mode and not device_read,
         single_data_source=proxy_mode,
     )
     val_loader = _setup_dataloader(
@@ -220,7 +220,7 @@ def create_train_val_loaders(
         num_workers=loader_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
-        pin_memory=not proxy_mode,
+        pin_memory=not proxy_mode and not device_read,
         single_data_source=proxy_mode,
     )
 

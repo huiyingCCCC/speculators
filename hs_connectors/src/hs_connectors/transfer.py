@@ -27,6 +27,16 @@ def _set_direct_read_enabled(enabled: bool) -> None:
     _direct_read_enabled = enabled
 
 
+def _is_non_root_rank() -> bool:
+    """Return whether this process is a non-root distributed rank."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() != 0
+    try:
+        return int(os.environ.get("RANK", "0")) != 0
+    except ValueError:
+        return False
+
+
 def adxl_proxy_requested() -> bool:
     """Return whether the launch requested ADXL proxy coordination."""
     # Direct-read mode supersedes proxy broadcast.  This is process-local state
@@ -50,12 +60,7 @@ def adxl_proxy_enabled() -> bool:
     """
     if not adxl_proxy_requested():
         return False
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank() != 0
-    try:
-        return int(os.environ.get("RANK", "0")) != 0
-    except ValueError:
-        return False
+    return _is_non_root_rank()
 
 
 if TYPE_CHECKING:
@@ -421,6 +426,11 @@ class MooncakeBackend(HiddenStatesBackend):
             # leaving TCP/RDMA/File backends untouched.
             _set_direct_read_enabled(True)
             proxy = False
+            if _is_non_root_rank():
+                # Read-only Ascend consumers do not publish local replicas.
+                # Keep the local buffer: metadata and token_ids still use
+                # Mooncake's regular get_tensor/get_buffer path.
+                store.config.global_segment_size = 0
         else:
             _set_direct_read_enabled(False)
             proxy = adxl_proxy_enabled()
