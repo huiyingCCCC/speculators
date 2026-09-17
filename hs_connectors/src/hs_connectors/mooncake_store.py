@@ -108,6 +108,7 @@ class MooncakeHiddenStatesStore:
     def __init__(self, config: MooncakeStoreConfig):
         self.config = config
         self._store = None
+        self._engine = None
 
     @property
     def is_setup(self):
@@ -117,27 +118,43 @@ class MooncakeHiddenStatesStore:
         if self._store is not None:
             return self
         try:
+            from mooncake.engine import (  # type: ignore[import-not-found] # noqa: PLC0415
+                TransferEngine,
+            )
             from mooncake.store import (  # type: ignore[import-not-found] # noqa: PLC0415
                 MooncakeDistributedStore,
             )
         except ImportError as e:  # pragma: no cover - optional dependency
             raise ImportError(
                 "Mooncake is required for the Mooncake hidden-states backend. "
-                "Install it with `pip install mooncake-transfer-engine` or "
-                "`pip install mooncake-transfer-engine-cuda13`."
+                "Install a transfer-engine package compatible with the target "
+                "accelerator, such as `mooncake-transfer-engine-npu` on Ascend."
             ) from e
 
-        store = MooncakeDistributedStore()
-        result = store.setup(
+        engine = TransferEngine()
+        result = engine.initialize(
             self.config.local_hostname,
             self.config.metadata_server,
-            self.config.global_segment_size,
-            self.config.local_buffer_size,
             self.config.protocol,
             self.config.device_name,
-            self.config.master_server_address,
         )
-        _check_store_result("setup", self.config.local_hostname, result)
+        _check_store_result("engine setup", self.config.local_hostname, result)
+
+        local_segment = f"{self.config.local_hostname}:{engine.get_rpc_port()}"
+        store = MooncakeDistributedStore()
+        result = store.setup(
+            local_hostname=local_segment,
+            metadata_server=self.config.metadata_server,
+            global_segment_size=self.config.global_segment_size,
+            local_buffer_size=self.config.local_buffer_size,
+            protocol=self.config.protocol,
+            rdma_devices=self.config.device_name,
+            master_server_addr=self.config.master_server_address,
+            engine=engine.get_engine(),
+        )
+        _check_store_result("setup", local_segment, result)
+        # MooncakeDistributedStore retains only the native engine handle.
+        self._engine = engine
         self._store = store
         return self
 
