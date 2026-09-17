@@ -17,3 +17,8 @@ Benchmark and evaluate your trained speculator models.
 ## [Serve in vLLM](serve_vllm.md)
 
 Deploy your trained speculator models in vLLM for production inference.
+
+## [Mooncake TCP-only Source Build](mooncake_tcp_source_build.md)
+
+Build and install Mooncake from source in an Ascend Docker environment, then
+validate hidden-state transfer over TCP.
