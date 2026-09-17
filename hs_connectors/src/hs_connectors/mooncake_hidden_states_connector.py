@@ -232,7 +232,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         if not self._store_ready:
             assert self._accelerator is not None
             self._accelerator.activate_device()
-            self._store.setup()
+            assert self._kv_cache is not None
+            self._store.setup(device=self._kv_cache.device)
             self._store_ready = True
 
     def _write_sample(self, pending: PendingSave, ready_event: Any) -> None:

@@ -14,6 +14,7 @@ import os
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -75,6 +76,49 @@ def _check_store_result(operation: str, key: str, result: Any) -> None:
         )
 
 
+def _dtype_from_str(s: str) -> torch.dtype:
+    # Manifests have historically used both ``bfloat16`` and
+    # ``torch.bfloat16`` (and a few producers emit different casing).  Keep
+    # decoding tolerant so a formatting difference does not discard a sample.
+    s = s.strip().lower()
+    if s.startswith("torch."):
+        s = s[6:]
+    mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float64": torch.float64,
+        "int64": torch.int64,
+        "int32": torch.int32,
+        "int16": torch.int16,
+        "int8": torch.int8,
+        "uint8": torch.uint8,
+        "bool": torch.bool,
+    }
+    return mapping.get(s, torch.float32)
+
+
+def _npu_synchronize() -> None:
+    """Synchronize the active NPU stream before/after an ADXL transfer."""
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        # Some torch_npu versions only expose the namespace after importing
+        # the extension module.
+        import torch_npu  # type: ignore[import-not-found] # noqa: PLC0415
+
+        npu = torch_npu.npu
+    npu.synchronize()
+
+
+def _shape_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+    numel = 1
+    for d in shape:
+        if d < 0:
+            raise ValueError(f"tensor shape dimensions must be non-negative, got {shape}")
+        numel *= d
+    return numel * torch.empty((), dtype=dtype).element_size()
+
+
 @dataclass
 class MooncakeStoreConfig:
     """Connection settings, passed straight to ``MooncakeDistributedStore.setup``."""
@@ -87,6 +131,8 @@ class MooncakeStoreConfig:
     protocol: str = "tcp"
     device_name: str = ""
     num_writer_threads: int = 4
+    adxl_pool_slots: int = 2
+    adxl_slot_bytes: int = 512 * 1024 * 1024
 
     @classmethod
     def from_dict(cls, d: dict | None) -> MooncakeStoreConfig:
@@ -98,13 +144,129 @@ class MooncakeStoreConfig:
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
+class _AdxlPool:
+    """Fixed-size registered NPU buffers shared by Mooncake ADXL transfers.
+
+    Registration is deliberately done once in :meth:`setup`.  A slot remains
+    registered for the lifetime of the store; put/get only acquire a slot and
+    submit a transfer using its already-registered pointer.
+    """
+
+    def __init__(self, store: Any, num_slots: int, slot_bytes: int):
+        if num_slots <= 0 or slot_bytes <= 0:
+            raise ValueError("ADXL pool slots and slot bytes must be positive")
+        self._store = store
+        self._num_slots = num_slots
+        self._slot_bytes = slot_bytes
+        self._pool: torch.Tensor | None = None
+        self._slots: list[torch.Tensor] = []
+        self._free: list[int] = []
+        self._condition = threading.Condition()
+        self._device: torch.device | None = None
+
+    @property
+    def slot_bytes(self) -> int:
+        return self._slot_bytes
+
+    @property
+    def is_setup(self) -> bool:
+        return bool(self._slots)
+
+    def setup(self, device: torch.device) -> None:
+        if self.is_setup:
+            return
+        total = self._slot_bytes * self._num_slots
+        try:
+            with torch.inference_mode(False):
+                pool = torch.empty(total, dtype=torch.uint8, device=device)
+            base_ptr = pool.data_ptr()
+            result = self._store.register_buffer(base_ptr, total)
+            _check_store_result("register_buffer", "<adxl-pool>", result)
+        except Exception:
+            try:
+                self._store.unregister_buffer(pool.data_ptr())
+            except Exception:
+                logger.exception("Failed to unregister ADXL pool buffer")
+            raise
+        self._pool = pool
+        self._slots = [
+            pool[i * self._slot_bytes: (i + 1) * self._slot_bytes]
+            for i in range(self._num_slots)
+        ]
+        self._free = list(range(len(self._slots)))
+        self._device = device
+
+    def close(self) -> None:
+        """Unregister pool buffer. Best effort; native handles may be process-owned."""
+        if self._pool is not None:
+            try:
+                _check_store_result(
+                    "unregister_buffer",
+                    "<adxl-pool>",
+                    self._store.unregister_buffer(self._pool.data_ptr()),
+                )
+            except Exception:
+                logger.exception("Failed to unregister ADXL pool buffer")
+        self._pool = None
+        self._slots.clear()
+        self._free.clear()
+        self._device = None
+
+    @contextmanager
+    def acquire(self, nbytes: int):
+        if nbytes < 0 or nbytes > self._slot_bytes:
+            raise ValueError(
+                f"ADXL tensor requires {nbytes} bytes, pool slot is {self._slot_bytes} bytes"
+            )
+        with self._condition:
+            while not self._free:
+                self._condition.wait()
+            index = self._free.pop()
+        try:
+            yield self._slots[index]
+        finally:
+            with self._condition:
+                self._free.append(index)
+                self._condition.notify()
+
+    def put(self, key: str, tensor: torch.Tensor) -> None:
+        nbytes = tensor.numel() * tensor.element_size()
+        with self.acquire(nbytes) as slot:
+            source = tensor.view(torch.uint8).reshape(-1)
+            slot[:nbytes].copy_(source, non_blocking=False)
+            _npu_synchronize()
+            result = self._store.batch_put_from([key], [slot.data_ptr()], [nbytes])
+            if len(result) != 1:
+                raise RuntimeError(
+                    f"batch_put_from returned {len(result)} results for {key}"
+                )
+            _check_store_result("batch_put_from", key, result[0])
+
+    def get(
+        self,
+        key: str,
+        nbytes: int,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        with self.acquire(nbytes) as slot:
+            result = self._store.batch_get_into([key], [slot.data_ptr()], [nbytes])
+            if len(result) != 1 or int(result[0]) != nbytes:
+                raise MooncakeIntegrityError(
+                    f"Mooncake batch_get_into failed for {key}: expected {nbytes}, got {result}"
+                )
+            _npu_synchronize()
+            raw = slot[:nbytes].clone().to("cpu")
+        return raw.view(dtype).reshape(shape)
+
+
 class MooncakeHiddenStatesStore:
     """Stores/loads tensor dicts in a Mooncake store.
 
-    Each sample is written via ``put_tensor`` under ``{key}:{name}`` plus a
-    versioned ``{key}:meta`` JSON manifest. The manifest includes shape, dtype,
-    and CRC32 for every tensor and is written last, so its presence marks the
-    sample complete and ``get_sample`` can poll for it.
+    Host tensors are written via ``put_tensor`` under ``{key}:{name}``; NPU
+    floating-point tensors use the registered ADXL pool. Both paths share a
+    versioned ``{key}:meta`` JSON manifest, written last so its presence marks
+    the sample complete and ``get_sample`` can poll for it.
     """
 
     def __init__(self, config: MooncakeStoreConfig):
@@ -113,12 +275,14 @@ class MooncakeHiddenStatesStore:
         self._engine = None
         self._owner_pid: int | None = None
         self._register_lock = threading.Lock()
+        self._adxl_pool: _AdxlPool | None = None
+        self._adxl_context: Any = None
 
     @property
     def is_setup(self):
         return self._store is not None and self._owner_pid == os.getpid()
 
-    def setup(self) -> MooncakeHiddenStatesStore:
+    def setup(self, device: torch.device | None = None) -> MooncakeHiddenStatesStore:
         pid = os.getpid()
         if self._store is not None and self._owner_pid == pid:
             return self
@@ -126,6 +290,8 @@ class MooncakeHiddenStatesStore:
             # Native Mooncake handles must never be reused after fork.
             self._store = None
             self._engine = None
+            self._adxl_pool = None
+            self._adxl_context = None
         try:
             from mooncake.engine import (  # type: ignore[import-not-found] # noqa: PLC0415
                 TransferEngine,
@@ -166,7 +332,93 @@ class MooncakeHiddenStatesStore:
         self._engine = engine
         self._store = store
         self._owner_pid = pid
+        self._adxl_context = self._capture_npu_context()
+        if self.config.protocol == "ascend":
+            device = device or self._current_npu_device()
+            if device.type != "npu":
+                raise ValueError(f"Ascend ADXL pool requires an NPU device, got {device}")
+            self._adxl_pool = _AdxlPool(
+                store, self.config.adxl_pool_slots, self.config.adxl_slot_bytes
+            )
+            self._adxl_pool.setup(device)
         return self
+
+    def _capture_npu_context(self) -> Any:
+        """Save the engine's ACL context for calls made by writer threads."""
+        if self.config.protocol != "ascend":
+            return None
+
+        try:
+            import acl  # type: ignore[import-not-found] # noqa: PLC0415
+            getter = getattr(acl, "aclrtGetCurrentContext", None)
+            if getter is not None:
+                context = getter()
+                # ACL Python releases have returned either ``context`` or a
+                # ``(context, status)``/``(status, context)`` pair.
+                if isinstance(context, tuple):
+                    if len(context) != 2:
+                        context = context[0] if context else None
+                    elif isinstance(context[0], int):
+                        context = context[1] if context[0] == 0 else None
+                    elif isinstance(context[1], int):
+                        context = context[0] if context[1] == 0 else None
+                    else:
+                        context = context[0]
+                return context if context else None
+
+            # Compatibility with releases exposing the same calls under
+            # ``acl.rt`` instead of the C-style top-level names.
+            context, status = acl.rt.get_context()
+            return context if status == 0 and context else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _restore_npu_context(self) -> None:
+        """Bind this thread to the ACL context used to initialize the engine."""
+        if self._adxl_context is None:
+            return
+
+        try:
+            import acl  # type: ignore[import-not-found] # noqa: PLC0415
+
+            setter = getattr(acl, "aclrtSetCurrentContext", None)
+            if setter is not None:
+                setter(self._adxl_context)
+            else:
+                acl.rt.set_context(self._adxl_context)
+        except Exception:  # noqa: BLE001
+            # Context restoration is best effort on non-Ascend test hosts and
+            # with older ACL Python bindings.  The transfer call still runs.
+            pass
+
+    @staticmethod
+    def _current_npu_device() -> torch.device:
+        try:
+            import torch_npu  # type: ignore[import-not-found] # noqa: PLC0415
+
+            return torch.device("npu", torch_npu.npu.current_device())
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError("Ascend Mooncake requires torch_npu and an active NPU") from exc
+
+    @contextmanager
+    def _npu_context(self):
+        if self.config.protocol != "ascend":
+            yield
+            return
+        import torch_npu  # type: ignore[import-not-found] # noqa: PLC0415
+
+        previous = torch_npu.npu.current_device()
+        target = (
+            self._adxl_pool._device
+            if self._adxl_pool is not None
+            else torch.device("npu", previous)
+        )
+        torch_npu.npu.set_device(target)
+        self._restore_npu_context()
+        try:
+            yield
+        finally:
+            torch_npu.npu.set_device(previous)
 
     def put_sample(self, key: str, tensors: dict[str, torch.Tensor]) -> None:
         if self._store is None:
@@ -188,6 +440,7 @@ class MooncakeHiddenStatesStore:
             manifest_tensors[name] = {
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype),
+                "nbytes": _shape_nbytes(tuple(tensor.shape), tensor.dtype),
                 "checksum": _tensor_checksum(checksum_tensor),
             }
 
@@ -201,22 +454,11 @@ class MooncakeHiddenStatesStore:
                         raise ValueError(
                             f"Ascend Direct tensor {name!r} must be contiguous"
                         )
-                    size = tensor.numel() * tensor.element_size()
-                    ptr = tensor.data_ptr()
-                    with self._register_lock:
-                        register_result = self._store.register_buffer(ptr, size)
-                        _check_store_result(
-                            "register_buffer", tensor_key, register_result
-                        )
-                        try:
-                            result = self._store.batch_put_from(
-                                [tensor_key], [ptr], [size]
-                            )[0]
-                        finally:
-                            unregister_result = self._store.unregister_buffer(ptr)
-                            _check_store_result(
-                                "unregister_buffer", tensor_key, unregister_result
-                            )
+                    if self._adxl_pool is None:
+                        raise RuntimeError("ADXL pool was not initialized")
+                    with self._npu_context(), self._register_lock:
+                        self._adxl_pool.put(tensor_key, tensor)
+                    result = 0
                     operation = "batch_put_from"
                 else:
                     result = self._store.put_tensor(tensor_key, tensor)
@@ -286,7 +528,23 @@ class MooncakeHiddenStatesStore:
 
         result = {}
         for name, spec in tensor_specs.items():
-            tensor = self._store.get_tensor(f"{key}:{name}")
+            expected_shape = tuple(spec.get("shape", ()))
+            expected_dtype = _dtype_from_str(str(spec.get("dtype", "")))
+            expected_nbytes = int(
+                spec.get("nbytes", _shape_nbytes(expected_shape, expected_dtype))
+            )
+            if (
+                self.config.protocol == "ascend"
+                and self._adxl_pool is not None
+                and expected_dtype.is_floating_point
+                and expected_nbytes <= self._adxl_pool.slot_bytes
+            ):
+                with self._npu_context(), self._register_lock:
+                    tensor = self._adxl_pool.get(
+                        f"{key}:{name}", expected_nbytes, expected_dtype, expected_shape
+                    )
+            else:
+                tensor = self._store.get_tensor(f"{key}:{name}")
             if tensor is None:
                 raise MooncakeIntegrityError(
                     f"Mooncake tensor unavailable for key={key}:{name}"
@@ -339,16 +597,16 @@ class MooncakeHiddenStatesStore:
                 f"expected object, got {type(spec).__name__}"
             )
         expected_shape = tuple(spec.get("shape", ()))
-        expected_dtype = spec.get("dtype")
+        expected_dtype = _dtype_from_str(str(spec.get("dtype", "")))
         if tuple(tensor.shape) != expected_shape:
             raise MooncakeIntegrityError(
                 f"Mooncake shape mismatch for key={key}:{name}: "
                 f"expected={expected_shape}, actual={tuple(tensor.shape)}"
             )
-        if str(tensor.dtype) != expected_dtype:
+        if tensor.dtype != expected_dtype:
             raise MooncakeIntegrityError(
                 f"Mooncake dtype mismatch for key={key}:{name}: "
-                f"expected={expected_dtype}, actual={tensor.dtype}"
+                f"expected={spec.get('dtype')}, actual={tensor.dtype}"
             )
         expected_checksum = spec.get("checksum")
         actual_checksum = _tensor_checksum(_cpu_contiguous(tensor))
