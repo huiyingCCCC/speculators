@@ -190,6 +190,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._is_tp_rank_zero = get_tensor_model_parallel_rank() == 0
 
+        if not self._is_tp_rank_zero:
+            # Non-zero TP workers do not publish hidden states and must not
+            # retain an accelerator/store handle for the producer path.
+            return
+
         from vllm.model_executor.models.extract_hidden_states import (  # noqa: PLC0415
             CacheOnlyAttentionLayer,
         )
@@ -202,7 +207,14 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             f"Expected 1 CacheOnlyAttentionLayer, got {len(cache_layers)}"
         )
         self._kv_cache = kv_caches[cache_layers[0]]
-        self._accelerator = AcceleratorContext.for_device(self._kv_cache.device)
+        if self._is_tp_rank_zero:
+            self._accelerator = AcceleratorContext.for_device(self._kv_cache.device)
+            if self._num_writer_threads > 1:
+                logger.warning(
+                    "Ascend Direct producer uses one writer thread to serialize "
+                    "buffer registration and transfer"
+                )
+                self._num_writer_threads = 1
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -213,6 +225,10 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         return self._executor
 
     def _ensure_store(self) -> None:
+        # Only TP0 publishes the complete extracted hidden state. Other TP
+        # workers must not create competing Ascend Direct engines.
+        if not self._is_tp_rank_zero:
+            return
         if not self._store_ready:
             assert self._accelerator is not None
             self._accelerator.activate_device()
@@ -250,18 +266,14 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     self._kv_cache, slot_mapping, num_tokens
                 )
                 assert_finite("hidden_states", hidden_states)
-                # Async DtoH copy into pinned host memory.
-                pinned_hs = torch.empty_like(
-                    hidden_states, device="cpu", pin_memory=True
-                )
-                pinned_hs.copy_(hidden_states, non_blocking=True)
-
-            # Wait for the DtoH copy to complete before handing data to the store.
+            # The direct transport reads the NPU view asynchronously. Ensure the
+            # gather and finite check queued on the copy stream are complete before
+            # handing its pointer to Mooncake; this is a device sync, not a D2H copy.
             copy_stream.synchronize()
 
             self._store.put_sample(
                 pending.mooncake_key,
-                {"hidden_states": pinned_hs, "token_ids": pending.token_ids},
+                {"hidden_states": hidden_states, "token_ids": pending.token_ids},
             )
         except Exception as exc:
             try:
