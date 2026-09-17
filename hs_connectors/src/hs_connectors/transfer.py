@@ -18,10 +18,31 @@ from safetensors.torch import load_file
 from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
 
 ADXL_PROXY_ENV = "MOONCAKE_ADXL_PROXY"
+_direct_read_enabled = False
+
+
+def _set_direct_read_enabled(enabled: bool) -> None:
+    """Set direct-read state for this training process."""
+    global _direct_read_enabled  # noqa: PLW0603
+    _direct_read_enabled = enabled
+
+
+def _is_non_root_rank() -> bool:
+    """Return whether this process is a non-root distributed rank."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() != 0
+    try:
+        return int(os.environ.get("RANK", "0")) != 0
+    except ValueError:
+        return False
 
 
 def adxl_proxy_requested() -> bool:
     """Return whether the launch requested ADXL proxy coordination."""
+    # Direct-read mode supersedes proxy broadcast.  This is process-local state
+    # set by the selected Mooncake backend, not a global environment override.
+    if _direct_read_enabled:
+        return False
     return os.environ.get(ADXL_PROXY_ENV, "").strip().lower() in {
         "1",
         "true",
@@ -39,12 +60,7 @@ def adxl_proxy_enabled() -> bool:
     """
     if not adxl_proxy_requested():
         return False
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank() != 0
-    try:
-        return int(os.environ.get("RANK", "0")) != 0
-    except ValueError:
-        return False
+    return _is_non_root_rank()
 
 
 if TYPE_CHECKING:
@@ -76,6 +92,11 @@ def wait_for_lock(lock_path: str, timeout: float = 10.0, poll_interval: float = 
 class HiddenStatesTransfer(ABC):
     """Interface for reading hidden states produced by vLLM."""
 
+    @property
+    def supports_device_read(self) -> bool:
+        """Whether generated hidden states can be read into a device tensor."""
+        return False
+
     def setup(self) -> None:  # noqa: B027
         """Lazy initialization (safe to call from dataloader worker)."""
 
@@ -84,7 +105,13 @@ class HiddenStatesTransfer(ABC):
         """Return a previously cached sample, or ``None``."""
 
     @abstractmethod
-    def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+    def get_generated(
+        self,
+        handle: str,
+        *,
+        hidden_states_out: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor] | None:
         """Retrieve a freshly generated sample by its vLLM-returned handle."""
 
     def cache(self, handle: str, file_idx: int) -> None:  # noqa: B027
@@ -173,7 +200,13 @@ class FileTransfer(HiddenStatesTransfer):
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
         return _load_hs_file(path)
 
-    def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+    def get_generated(
+        self,
+        handle: str,
+        *,
+        hidden_states_out: torch.Tensor | None = None,  # noqa: ARG002
+        device: torch.device | None = None,  # noqa: ARG002
+    ) -> dict[str, torch.Tensor] | None:
         return _load_hs_file(Path(handle))
 
     def cache(self, handle: str, file_idx: int) -> None:
@@ -245,6 +278,10 @@ class MooncakeTransfer(HiddenStatesTransfer):
         self.store = store
         self.proxy = proxy
 
+    @property
+    def supports_device_read(self) -> bool:
+        return not self.proxy and self.store.config.protocol == "ascend"
+
     def setup(self) -> None:
         if self.proxy:
             return
@@ -265,9 +302,19 @@ class MooncakeTransfer(HiddenStatesTransfer):
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002
         return None
 
-    def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+    def get_generated(
+        self,
+        handle: str,
+        *,
+        hidden_states_out: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor] | None:
         if self.proxy:
             return None
+        if hidden_states_out is not None or device is not None:
+            return self.store.get_sample_into(
+                handle, hidden_states_out, device=device
+            )
         return self.store.get_sample(handle)
 
     def delete(self, handle: str) -> None:
@@ -373,7 +420,21 @@ class MooncakeBackend(HiddenStatesBackend):
                 adxl_slot_bytes=getattr(args, "mooncake_adxl_slot_mib", 512) * 1024**2,
             )
         )
-        return MooncakeTransfer(store, proxy=adxl_proxy_enabled())
+        if args.mooncake_protocol == "ascend":
+            # Every training rank owns a Mooncake consumer and reads its own
+            # samples.  This disables the legacy rank-0 proxy broadcast while
+            # leaving TCP/RDMA/File backends untouched.
+            _set_direct_read_enabled(True)
+            proxy = False
+            if _is_non_root_rank():
+                # Read-only Ascend consumers do not publish local replicas.
+                # Keep the local buffer: metadata and token_ids still use
+                # Mooncake's regular get_tensor/get_buffer path.
+                store.config.global_segment_size = 0
+        else:
+            _set_direct_read_enabled(False)
+            proxy = adxl_proxy_enabled()
+        return MooncakeTransfer(store, proxy=proxy)
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:

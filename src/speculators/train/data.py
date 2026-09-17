@@ -160,6 +160,7 @@ class ArrowDataset(BaseDataset):
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         should_generate: bool = True,
+        hidden_states_device: torch.device | None = None,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -190,6 +191,7 @@ class ArrowDataset(BaseDataset):
         self.request_timeout = request_timeout
         self.max_retries = max_retries
         self.should_generate = should_generate
+        self.hidden_states_device = hidden_states_device
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -237,7 +239,12 @@ class ArrowDataset(BaseDataset):
                 max_retries=self.max_retries,
             )
 
-            loaded_hs = self.transfer.get_generated(handle)
+            if self.hidden_states_device is None:
+                loaded_hs = self.transfer.get_generated(handle)
+            else:
+                loaded_hs = self.transfer.get_generated(
+                    handle, device=self.hidden_states_device
+                )
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 

@@ -176,9 +176,9 @@ class _AdxlPool:
         if self.is_setup:
             return
         total = self._slot_bytes * self._num_slots
+        with torch.inference_mode(False):
+            pool = torch.empty(total, dtype=torch.uint8, device=device)
         try:
-            with torch.inference_mode(False):
-                pool = torch.empty(total, dtype=torch.uint8, device=device)
             base_ptr = pool.data_ptr()
             result = self._store.register_buffer(base_ptr, total)
             _check_store_result("register_buffer", "<adxl-pool>", result)
@@ -258,6 +258,47 @@ class _AdxlPool:
             _npu_synchronize()
             raw = slot[:nbytes].clone().to("cpu")
         return raw.view(dtype).reshape(shape)
+
+    def get_into(
+        self,
+        key: str,
+        destination: torch.Tensor,
+        nbytes: int,
+    ) -> torch.Tensor:
+        """Read an ADXL object into an independent tensor on the pool device.
+
+        The registered slot is temporary and is returned to the pool when this
+        method exits.  Copying into a caller-owned destination before releasing
+        the slot lets callers keep the result on NPU without exposing reusable
+        pool memory.
+        """
+        if not self.is_setup or self._device is None:
+            raise RuntimeError("ADXL pool is not initialized")
+        if destination.device != self._device:
+            raise ValueError(
+                f"ADXL destination must be on {self._device}, got {destination.device}"
+            )
+        if not destination.is_contiguous():
+            raise ValueError("ADXL destination must be contiguous")
+        destination_nbytes = destination.numel() * destination.element_size()
+        if destination_nbytes != nbytes:
+            raise ValueError(
+                f"ADXL destination has {destination_nbytes} bytes, expected {nbytes}"
+            )
+
+        with self.acquire(nbytes) as slot:
+            result = self._store.batch_get_into([key], [slot.data_ptr()], [nbytes])
+            if len(result) != 1 or int(result[0]) != nbytes:
+                raise MooncakeIntegrityError(
+                    f"Mooncake batch_get_into failed for {key}: expected {nbytes}, got {result}"
+                )
+            _npu_synchronize()
+
+            destination_bytes = destination.view(torch.uint8).reshape(-1)
+            destination_bytes.copy_(slot[:nbytes], non_blocking=False)
+            # Do not recycle the slot while the device copy may still read it.
+            _npu_synchronize()
+        return destination
 
 
 class MooncakeHiddenStatesStore:
@@ -549,6 +590,82 @@ class MooncakeHiddenStatesStore:
                 raise MooncakeIntegrityError(
                     f"Mooncake tensor unavailable for key={key}:{name}"
                 )
+            self._validate_tensor(key, name, tensor, spec)
+            result[name] = tensor
+        return result
+
+    def get_sample_into(
+        self,
+        key: str,
+        hidden_states_out: torch.Tensor | None = None,
+        *,
+        device: torch.device | None = None,
+        timeout: float = 120.0,
+        poll_interval: float = 0.05,
+    ) -> dict[str, torch.Tensor]:
+        """Read Ascend hidden states into a device-resident NPU tensor.
+
+        A caller may provide ``hidden_states_out`` for buffer reuse, or provide
+        ``device`` to allocate from the manifest shape and dtype. Only the
+        floating-point ``hidden_states`` object uses ADXL; small CPU objects
+        such as ``token_ids`` continue through ``get_tensor``.
+        """
+        if self._store is None:
+            raise RuntimeError("call setup() first")
+        if self.config.protocol != "ascend" or self._adxl_pool is None:
+            raise RuntimeError(
+                "get_sample_into requires an initialized Ascend ADXL pool"
+            )
+        if hidden_states_out is None and device is None:
+            raise ValueError("hidden_states_out or device must be provided")
+        if hidden_states_out is not None and device is not None:
+            raise ValueError("provide hidden_states_out or device, not both")
+
+        raw_manifest = self._wait_for(f"{key}:meta", timeout, poll_interval)
+        tensor_specs = self._parse_manifest(key, raw_manifest)
+        result: dict[str, torch.Tensor] = {}
+        for name, spec in tensor_specs.items():
+            expected_shape = tuple(spec.get("shape", ()))
+            expected_dtype = _dtype_from_str(str(spec.get("dtype", "")))
+            expected_nbytes = int(
+                spec.get("nbytes", _shape_nbytes(expected_shape, expected_dtype))
+            )
+            if name == "hidden_states":
+                if (
+                    not expected_dtype.is_floating_point
+                    or expected_nbytes > self._adxl_pool.slot_bytes
+                ):
+                    raise MooncakeIntegrityError(
+                        f"ADXL cannot read hidden_states for key={key}: "
+                        f"dtype={expected_dtype}, nbytes={expected_nbytes}"
+                    )
+                if hidden_states_out is None:
+                    with torch.inference_mode(False):
+                        hidden_states_out = torch.empty(
+                            expected_shape,
+                            dtype=expected_dtype,
+                            device=device,
+                        )
+                if tuple(hidden_states_out.shape) != expected_shape:
+                    raise ValueError(
+                        f"hidden_states_out has shape {tuple(hidden_states_out.shape)}, "
+                        f"expected {expected_shape}"
+                    )
+                if hidden_states_out.dtype != expected_dtype:
+                    raise ValueError(
+                        f"hidden_states_out has dtype {hidden_states_out.dtype}, "
+                        f"expected {expected_dtype}"
+                    )
+                with self._npu_context(), self._register_lock:
+                    tensor = self._adxl_pool.get_into(
+                        f"{key}:{name}", hidden_states_out, expected_nbytes
+                    )
+            else:
+                tensor = self._store.get_tensor(f"{key}:{name}")
+                if tensor is None:
+                    raise MooncakeIntegrityError(
+                        f"Mooncake tensor unavailable for key={key}:{name}"
+                    )
             self._validate_tensor(key, name, tensor, spec)
             result[name] = tensor
         return result
