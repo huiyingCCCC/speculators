@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -172,6 +173,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--timing-log",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a JSONL file where per-sample timing records (idx, vlmm_s, write_s) "
+            "are appended as they complete. Used for latency-distribution experiments."
+        )
+    )
+    parser.add_argument(
         "--world-size",
         type=int,
         default=1,
@@ -209,6 +219,7 @@ async def worker(  # noqa: C901
     cancel_event: asyncio.Event,
     failure_tracker: _FailureTracker | None,
     stats: dict[str, Any],
+    timing_log: Path | None = None,
 ):
     """Worker that pulls items from queue and sends them to the vLLM endpoint."""
     while True:
@@ -277,6 +288,14 @@ async def worker(  # noqa: C901
             stats["ok"] += 1
             stats["total_vllm_s"] += vllm_s
             stats["total_write_s"] += write_s
+            if timing_log is not None:
+                record = {
+                    "idx": idx,
+                    "vllm_s": round(vllm_s, 4),
+                    "write_s": round(write_s, 4),
+                }
+                with timing_log.open("a") as fn:
+                    fn.write(json.dumps(record) + "\n")
             logger.debug(
                 "Sample %d: vLLM %.0f ms, write %.0f ms",
                 idx,
@@ -347,6 +366,7 @@ async def generate_and_save_hidden_states(args, dataset):
     else:
         hidden_states_dir = Path(args.output)
     hidden_states_dir.mkdir(parents=True, exist_ok=True)
+    timing_log = Path(args.timing_log) if args.timing_log else None
 
     existing_file_indices = get_existing_hidden_state_indices(hidden_states_dir)
     num_samples = len(dataset)
@@ -413,6 +433,7 @@ async def generate_and_save_hidden_states(args, dataset):
                         cancel_event,
                         failure_tracker,
                         stats,
+                        timing_log,
                     )
                 )
                 for _ in range(args.concurrency * 2)

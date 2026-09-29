@@ -6,8 +6,8 @@ NNODES=1
 NPROC_PER_NODE=16
 MASTER_ADDR="127.0.0.1"
 MASTER_PORT="29501"
-NIC_NAME=""
-LOCAL_IP=""
+nic_name=""
+local_ip=""
 OUTPUT_DIR=""
 
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -60,23 +60,25 @@ torchrun \
         --confidence-head-with-markov \
         --loss-fn '{"ce": 0.3, "tv": 0.7}' \
         --confidence-head-alpha 1.0 \
+        --loss-implementation eager \
         --checkpoint-freq 0.1 \
-        --on-missing generate \
+        --on-missing raise \
         --on-generate delete \
         --vllm-endpoint http://$VLLM_IP:$VLLM_PORT/v1 \
         --request-timeout 900 \
         --max-retries 2 \
         --seed 42 \
-        --log-freq 10 \
+        -- max-steps 60 \
+        --log-freq 1 \
         --prefetch-factor 4 \
         --num-workers 8 \
         --trust-remote-code \
         --hidden-states-path $HIDDEN_STATES_PATH \
-        --draft-attn-impl spda \
+        --draft-attn-impl sdpa \
         --fsdp-shard \
         --dflash-decay-gamma 6 \
         --train-data-ratio 0.90 \
-        --loger tensorboard \
+        --logger tensorboard \
         --log-dir $OUTPUT_DIR/logs \
         --full-attention-indices 0 1 2 3 4
 
