@@ -120,6 +120,13 @@ class HiddenStatesTransfer(ABC):
     def delete(self, handle: str) -> None:  # noqa: B027
         """Clean up a generated sample (e.g. delete a temp file)."""
 
+    def mark_consumed(self, file_idx: int) -> None: # noqa: B027
+        """Signal that a sample has been consumed (used by async prefill).
+
+        In the async-prefill / bounded-window mode the producer (Prefill worker) evicts consumed samples to slide the
+        FIFO window. Backends that do not participate in that handshake treat this as a no-op.
+        """
+
 
 class HiddenStatesBackend(ABC):
     """Plugin interface for hidden-states transfer backends.
@@ -194,7 +201,7 @@ class FileTransfer(HiddenStatesTransfer):
     """File-system based hidden-states transfer (shared filesystem)."""
 
     def __init__(self, hidden_states_path: Path):
-        self.hidden_states_path = hidden_states_path
+        self.hidden_states_path = Path(hidden_states_path)
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
@@ -216,6 +223,13 @@ class FileTransfer(HiddenStatesTransfer):
 
     def delete(self, handle: str) -> None:
         Path(handle).unlink()
+
+    def mark_consumed(self, file_idx: int) -> None:
+        marker = self.hidden_states_path / f"hs_{file_idx}.donsumed"
+        self.hidden_states_path.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text("")
+        os.replace(tmp, marker)
 
 
 @HiddenStatesBackend.register("file")
